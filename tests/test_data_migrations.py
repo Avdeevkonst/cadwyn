@@ -3,6 +3,7 @@ import re
 from collections.abc import Callable, Coroutine
 from contextvars import ContextVar
 from datetime import date
+from io import StringIO
 from types import ModuleType
 from typing import Annotated, Any, Literal, get_args
 
@@ -11,6 +12,7 @@ from dirty_equals import IsPartialDict, IsStr
 from fastapi import APIRouter, Body, Cookie, File, Header, Query, Request, Response, UploadFile
 from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
+from starlette.responses import StreamingResponse
 
 from cadwyn import VersionedAPIRouter
 from cadwyn._compat import PYDANTIC_V2, model_dump
@@ -371,6 +373,7 @@ class TestRequestMigrations:
         assert clients[date(2000, 1, 1)].post(test_path, json={"foo": 1, "bar": "hewwo"}).json() == {
             "type": "InternalSchema",
             "foo": 1,
+            # we expect for the passed "bar" attribute to not get passed because it's not in the public schema
             "bar": None,
         }
         assert clients[date(2001, 1, 1)].post(test_path, json={"foo": 1, "bar": "hewwo"}).json() == {
@@ -642,6 +645,33 @@ class TestResponseMigrations:
         )
         assert resp.status_code == 200
 
+    def test__fastapi_response_migration__response_is_streaming_response_and_there_is_a_migration(
+        self,
+        create_versioned_clients: CreateVersionedClients,
+        test_path: Literal["/test"],
+        latest_module: ModuleType,
+        router: VersionedAPIRouter,
+    ):
+        @router.post(test_path, response_model=latest_module.AnyResponseSchema)
+        async def post_endpoint(request: Request):
+            return StreamingResponse(StringIO("streaming response"), status_code=200)
+
+        @convert_response_to_previous_version_for(latest_module.AnyResponseSchema)
+        def migrator(response: ResponseInfo):
+            response.status_code = 201
+
+        clients = create_versioned_clients(version_change(migrator=migrator))
+        resp = clients[date(2000, 1, 1)].post(test_path, json={})
+        assert resp.content == b"streaming response"
+        assert dict(resp.headers) == {"x-api-version": "2000-01-01"}
+        assert resp.status_code == 201
+        assert dict(resp.cookies) == {}
+
+        resp = clients[date(2001, 1, 1)].post(test_path, json={})
+        assert resp.content == b"streaming response"
+        assert dict(resp.headers) == {"x-api-version": "2001-01-01"}
+        assert resp.status_code == 200
+
     def test__fastapi_response_migration__response_only_has_status_code_and_there_is_no_migration(
         self,
         create_versioned_clients: CreateVersionedClients,
@@ -677,7 +707,7 @@ class TestResponseMigrations:
 
 
 class TestHowAndWhenMigrationsApply:
-    def test__migrate__with_no_migrations__should_not_raise_error(
+    def test__migrate_request_and_response__with_no_migrations__should_not_raise_error(
         self,
         test_path: Literal["/test"],
         create_versioned_clients: CreateVersionedClients,
@@ -690,6 +720,30 @@ class TestHowAndWhenMigrationsApply:
             "cookies": {},
             "query_params": {},
         }
+
+    def test__migrate_request__with_no_migrations__request_schema_should_be_from_latest(
+        self,
+        create_versioned_clients: CreateVersionedClients,
+        test_path: Literal["/test"],
+        latest_module,
+        router: VersionedAPIRouter,
+    ):
+        @router.post(test_path, response_model=latest_module.AnyResponseSchema)
+        async def endpoint(foo: latest_module.AnyRequestSchema):
+            assert isinstance(
+                foo, latest_module.AnyRequestSchema
+            ), f"Request schema is from: {foo.__class__.__module__}"
+            return {}
+
+        clients = create_versioned_clients(version_change(), version_change())
+        resp_2000 = clients[date(2000, 1, 1)].post(test_path, json={})
+        assert resp_2000.status_code, resp_2000.json()
+
+        resp_2001 = clients[date(2001, 1, 1)].post(test_path, json={})
+        assert resp_2001.status_code, resp_2001.json()
+
+        resp_2002 = clients[date(2002, 1, 1)].post(test_path, json={})
+        assert resp_2002.status_code, resp_2002.json()
 
     def test__migrate_one_version_down__migrations_are_applied_to_2000_version_but_not_to_2000(
         self,

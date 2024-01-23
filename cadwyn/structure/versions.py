@@ -11,20 +11,22 @@ from enum import Enum
 from types import ModuleType
 from typing import Any, ClassVar, ParamSpec, TypeAlias, TypeVar, cast
 
+import fastapi
 from fastapi import HTTPException, params
 from fastapi import Request as FastapiRequest
 from fastapi import Response as FastapiResponse
-from fastapi._compat import ModelField, _normalize_errors
+from fastapi._compat import _normalize_errors
 from fastapi.concurrency import run_in_threadpool
 from fastapi.dependencies.models import Dependant
 from fastapi.dependencies.utils import solve_dependencies
 from fastapi.exceptions import RequestValidationError
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.routing import APIRoute, _prepare_response_content
 from pydantic import BaseModel
 from starlette._utils import is_async_callable
 from typing_extensions import assert_never
 
-from cadwyn._compat import PYDANTIC_V2, Undefined, model_dump
+from cadwyn._compat import PYDANTIC_V2, ModelField, Undefined, model_dump
 from cadwyn._package_utils import IdentifierPythonPath, get_cls_pythonpath
 from cadwyn.exceptions import CadwynError, CadwynStructureError
 
@@ -301,13 +303,13 @@ class VersionBundle:
     async def _migrate_request(
         self,
         body_type: type[BaseModel] | None,
-        dependant: Dependant,
+        latest_dependant_with_internal_schema: Dependant,
         request: FastapiRequest,
         response: FastapiResponse,
         request_info: RequestInfo,
         current_version: VersionDate,
         latest_route: APIRoute,
-    ):
+    ) -> dict[str, Any]:
         path = request.scope["path"]
         method = request.method
         for v in reversed(self.versions):
@@ -320,22 +322,28 @@ class VersionBundle:
                     for instruction in version_change.alter_request_by_path_instructions[path]:
                         if method in instruction.methods:
                             instruction(request_info)
-
-        # TASK: https://github.com/zmievsa/cadwyn/issues/51
         request.scope["headers"] = tuple((key.encode(), value.encode()) for key, value in request_info.headers.items())
         del request._headers
         # Remember this: if len(body_params) == 1, then route.body_schema == route.dependant.body_params[0]
-
-        new_kwargs, errors, _, _, _ = await solve_dependencies(
-            request=request,
-            response=response,
-            dependant=dependant,
-            body=request_info.body,
-            dependency_overrides_provider=latest_route.dependency_overrides_provider,
-        )
-        if errors:
-            raise RequestValidationError(_normalize_errors(errors), body=request_info.body)
-        return new_kwargs
+        async with AsyncExitStack() as async_exit_stack:
+            # FastAPI has made a nasty breaking change in that version by adding a required argument
+            # without an optional counterpart.
+            if fastapi.__version__ >= "0.106.0":
+                kwargs: dict[str, Any] = {"async_exit_stack": async_exit_stack}
+            else:  # pragma: no cover
+                kwargs: dict[str, Any] = {}
+            dependencies, errors, _, _, _ = await solve_dependencies(
+                request=request,
+                response=response,
+                dependant=latest_dependant_with_internal_schema,
+                body=request_info.body,
+                dependency_overrides_provider=latest_route.dependency_overrides_provider,
+                **kwargs,
+            )
+            if errors:
+                raise RequestValidationError(_normalize_errors(errors), body=request_info.body)
+            return dependencies
+        raise NotImplementedError("This code should not be reachable. If it was reached -- it's a bug.")
 
     def _migrate_response(
         self,
@@ -411,7 +419,6 @@ class VersionBundle:
                     response_param_name,
                     kwargs,
                     response,
-                    is_async_callable(endpoint),
                 )
 
             if request_param_name == _CADWYN_REQUEST_PARAM_NAME:
@@ -432,11 +439,10 @@ class VersionBundle:
         response_param_name: str,
         kwargs: dict[str, Any],
         fastapi_response_dependency: FastapiResponse,
-        endpoint_is_async_callable: bool,
     ) -> Any:
         if response_param_name == _CADWYN_RESPONSE_PARAM_NAME:
             kwargs.pop(response_param_name)
-        if endpoint_is_async_callable:
+        if is_async_callable(func_to_get_response_from):
             response_or_response_body: FastapiResponse | object = await func_to_get_response_from(**kwargs)
         else:
             response_or_response_body: FastapiResponse | object = await run_in_threadpool(
@@ -446,12 +452,20 @@ class VersionBundle:
         api_version = self.api_version_var.get()
         if api_version is None:
             return response_or_response_body
+
         if isinstance(response_or_response_body, FastapiResponse):
-            response_info = ResponseInfo(
-                response_or_response_body,
+            # TODO (https://github.com/zmievsa/cadwyn/issues/125): Add support for migrating `StreamingResponse`
+            # TODO (https://github.com/zmievsa/cadwyn/issues/126): Add support for migrating `FileResponse`
+            # Starlette breaks Liskov Substitution principle and
+            # doesn't define `body` for `StreamingResponse` and `FileResponse`
+            if isinstance(response_or_response_body, StreamingResponse | FileResponse):
+                body = None
+            elif response_or_response_body.body:
+                body = json.loads(response_or_response_body.body)
+            else:
+                body = None
                 # TODO (https://github.com/zmievsa/cadwyn/issues/51): Only do this if there are migrations
-                json.loads(response_or_response_body.body) if response_or_response_body.body else None,
-            )
+            response_info = ResponseInfo(response_or_response_body, body)
         else:
             response_info = ResponseInfo(
                 fastapi_response_dependency,
@@ -473,11 +487,15 @@ class VersionBundle:
         if isinstance(response_or_response_body, FastapiResponse):
             # a webserver (uvicorn for instance) calculates the body at the endpoint level.
             # if an endpoint returns no "body", its content-length will be set to 0
-            # json.dums(None) results into "null", and content-length should be 4,
+            # json.dumps(None) results into "null", and content-length should be 4,
             # but it was already calculated to 0 which causes
             # `RuntimeError: Response content longer than Content-Length` or
             # `Too much data for declared Content-Length`, based on the protocol
-            if response_info.body is not None:
+            # which is why we skip the None case.
+
+            # We skip cases without "body" attribute because of StreamingResponse and FileResponse
+            # that do not have it. We don't support it too.
+            if response_info.body is not None and hasattr(response_info._response, "body"):
                 # TODO (https://github.com/zmievsa/cadwyn/issues/51): Only do this if there are migrations
                 response_info._response.body = json.dumps(response_info.body).encode()
             return response_info._response
@@ -487,13 +505,13 @@ class VersionBundle:
         self,
         template_module_body_field_for_request_migrations: type[BaseModel] | None,
         body_field_alias: str | None,
-        dependant_of_latest_version: Dependant,
+        latest_dependant_with_internal_schema: Dependant,
         request_param_name: str,
         kwargs: dict[str, Any],
         response: FastapiResponse,
         route: APIRoute,
         latest_route: APIRoute,
-    ):
+    ) -> dict[str, Any]:
         request: FastapiRequest = kwargs[request_param_name]
         if request_param_name == _CADWYN_REQUEST_PARAM_NAME:
             kwargs.pop(request_param_name)
@@ -502,26 +520,28 @@ class VersionBundle:
         if api_version is None:
             return kwargs
 
-        # TODO (https://github.com/zmievsa/cadwyn/issues/51): Make this zero-cost for migration-less cases
+        # This is a kind of body param you get when you define a single pydantic schema in your route's body
         if (
             len(route.dependant.body_params) == 1
             and template_module_body_field_for_request_migrations is not None
             and body_field_alias is not None
             and body_field_alias in kwargs
         ):
-            raw_body: BaseModel | None = kwargs[body_field_alias]
+            raw_body: BaseModel | None = kwargs.get(body_field_alias)
             if raw_body is None:
                 body = None
             else:
                 body = model_dump(raw_body, by_alias=True, exclude_unset=True)
-                if not PYDANTIC_V2 and kwargs[body_field_alias].__custom_root_type__:
+                if not PYDANTIC_V2 and raw_body.__custom_root_type__:  # pyright: ignore[reportGeneralTypeIssues]
                     body = body["__root__"]
         else:
+            # This is for requests without body or with complex body such as form or file
             body = await _get_body(request, route.body_field)
+
         request_info = RequestInfo(request, body)
         new_kwargs = await self._migrate_request(
             template_module_body_field_for_request_migrations,
-            dependant_of_latest_version,
+            latest_dependant_with_internal_schema,
             request,
             response,
             request_info,
@@ -529,12 +549,13 @@ class VersionBundle:
             latest_route,
         )
         # Because we re-added it into our kwargs when we did solve_dependencies
-        if request_param_name == _CADWYN_REQUEST_PARAM_NAME:
-            new_kwargs.pop(request_param_name)
+        if _CADWYN_REQUEST_PARAM_NAME in new_kwargs:
+            new_kwargs.pop(_CADWYN_REQUEST_PARAM_NAME)
 
         return new_kwargs
 
 
+# We use this instead of `.body()` to automatically guess body type and load the correct body, even if it's a form
 async def _get_body(request: FastapiRequest, body_field: ModelField | None):  # pragma: no cover # This is from fastapi
     is_body_form = body_field and isinstance(body_field.field_info, params.Form)
     try:

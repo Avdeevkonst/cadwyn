@@ -20,7 +20,7 @@ from cadwyn import VersionBundle, VersionedAPIRouter
 from cadwyn._compat import PYDANTIC_V2, model_fields
 from cadwyn.exceptions import CadwynError, RouterGenerationError
 from cadwyn.routing import generate_versioned_routers
-from cadwyn.structure import Version, endpoint, schema
+from cadwyn.structure import Version, convert_request_to_next_version_for, endpoint, schema
 from cadwyn.structure.enums import enum
 from cadwyn.structure.versions import VersionChange
 from tests._data.unversioned_schema_dir import UnversionedSchema2
@@ -981,6 +981,7 @@ def test__router_generation__updating_request_depends(
         assert resp_from_test2 == {
             "detail": [{"loc": ["body", "foo"], "msg": "field required", "type": "value_error.missing"}],
         }
+
     assert client_2000.post("/test1", json={"foo": "bar"}).json() == {}
     assert client_2000.post("/test2", json={"foo": "bar"}).json() == {}
 
@@ -1022,7 +1023,7 @@ class MySchema(BaseModel):
     assert client_2001.post("/test", json={"bar": "hello"}).json() == {"bar": "hello"}
 
 
-def test__router_generation__updating_unused_dependencies(
+def test__router_generation_updating_unused_dependencies__with_migration(
     router: VersionedAPIRouter,
     create_versioned_app: CreateVersionedApp,
     latest: ModuleType,
@@ -1036,10 +1037,14 @@ def test__router_generation__updating_unused_dependencies(
     async def test_with_dep():
         pass
 
+    def migration(request: Any):
+        return None
+
     app = create_versioned_app(
         version_change(
             enum(latest.StrEnum).didnt_have("a"),
             enum(latest.StrEnum).had(b="1"),
+            migration=convert_request_to_next_version_for("/test", ["GET"])(migration),
         ),
     )
 
